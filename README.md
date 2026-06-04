@@ -20,7 +20,7 @@
 
 ### 📺 デモ動画
 
-<video src="https://github.com/user-attachments/assets/ai-routing-demo.mov" controls width="100%" height="auto"></video>
+![デモ動画](https://github.com/user-attachments/assets/ai-routing-demo.mov)
 
 ---
 
