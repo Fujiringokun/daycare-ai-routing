@@ -20,7 +20,9 @@
 
 ### 📺 デモ動画
 
-![デモ動画](https://github.com/user-attachments/assets/ai-routing-demo.mov)
+[![デイサービス送迎 AI自動配車システム デモ](https://img.youtube.com/vi/PV4U24_uTg0/0.jpg)](https://youtu.be/PV4U24_uTg0)
+
+**クリックでデモ動画が再生されます（約30秒程度）**
 
 ---
 
