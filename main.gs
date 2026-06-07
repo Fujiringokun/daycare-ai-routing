@@ -145,11 +145,237 @@ function generateDailyAttendance() {
     Browser.msgBox("完了", "本日（" + targetDayName + "曜日）の出席者 " + insertValues.length + " 名を展開しました！", Browser.Buttons.OK);
   }
 }
-
 // ==========================================================
-// 機能3：【往路（朝のお迎え）】AI自動配車
+// 機能3：【往路（朝のお迎え）】AI自動配車（J列マスタ完全連動・最終完成版）
 // ==========================================================
-function runAiRouting() {
+function runAiRoutingV7() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var attendanceSheet = ss.getSheetByName("t_daily_attendance");
+  var basicSheet = ss.getSheetByName("m_user_basics");
+  var vehicleSheet = ss.getSheetByName("m_vehicles");
+  var conditionSheet = ss.getSheetByName("t_user_pickup_conditions"); 
+  var outputSheet = ss.getSheetByName("t_routing_outputs");
+  
+  var MAX_WAIT_MINUTES = 15; // 早く着きすぎた時の最大現地待機時間（15分）
+  
+  var targetDate = attendanceSheet.getRange("H1").getValue();
+  var officeLat = attendanceSheet.getRange("H2").getValue(); 
+  var officeLng = attendanceSheet.getRange("H3").getValue(); 
+  
+  if (!targetDate || !(targetDate instanceof Date) || officeLat === "" || officeLng === "") {
+    Browser.msgBox("エラー", "日付または施設の緯度経度を確認してください。", Browser.Buttons.OK);
+    return;
+  }
+  
+  var OFFICE_LAT = Number(officeLat); var OFFICE_LNG = Number(officeLng);
+  var attendanceData = attendanceSheet.getDataRange().getValues();
+  var todayUserIds = [];
+  for (var i = 2; i < attendanceData.length; i++) {
+    var rowDate = attendanceData[i][0]; var userId = String(attendanceData[i][1]).trim();
+    var status = attendanceData[i][3] ? String(attendanceData[i][3]).trim() : ""; 
+    if (rowDate instanceof Date && rowDate.getTime() === targetDate.getTime() && userId && status !== "欠席") {
+      todayUserIds.push(userId);
+    }
+  }
+  
+  if (todayUserIds.length === 0) { Browser.msgBox("お知らせ", "本日の利用者がいません。", Browser.Buttons.OK); return; }
+  
+  var basicData = basicSheet.getDataRange().getValues();
+  var userMap = {};
+  for (var i = 2; i < basicData.length; i++) {
+    var uId = String(basicData[i][0]).trim();
+    if (uId && uId !== "") {
+      userMap[uId] = { name: basicData[i][1], lat: Number(basicData[i][4]), lng: Number(basicData[i][5]), timeStart: null, timeEnd: null, wheelchairType: "一般席", ngPassenger: "", ngDriver: "" };
+    }
+  }
+  
+  var conditionRows = conditionSheet.getDataRange().getDisplayValues();
+  var headers = conditionRows[0]; var headerRowIdx = 0;
+  for (var r = 0; r < 2; r++) {
+    if (conditionRows[r].join("").indexOf("ID") !== -1 || conditionRows[r].join("").indexOf("id") !== -1) { headers = conditionRows[r]; headerRowIdx = r; break; }
+  }
+  
+  var colId = 0, colWhType = 2, colStart = 3, colEnd = 4, colNgP = 5, colNgD = 6;
+  for (var c = 0; c < headers.length; c++) {
+    var h = String(headers[c]).trim().toLowerCase();
+    if (h.indexOf("id") !== -1 && h.indexOf("vehicle") === -1 && h.indexOf("driver") === -1 && h.indexOf("passenger") === -1) colId = c;
+    if (h.indexOf("車椅子") !== -1 || h.indexOf("wheelchair") !== -1 || h.indexOf("区分") !== -1) colWhType = c;
+    
+    if (h.indexOf("dropoff") === -1 && h.indexOf("復路") === -1 && h.indexOf("送り") === -1) {
+      if (h.indexOf("開始") !== -1 || h.indexOf("start") !== -1 || h.indexOf("迎え希望") !== -1) colStart = c;
+      if (h.indexOf("終了") !== -1 || h.indexOf("end") !== -1 || h.indexOf("期限") !== -1 || h.indexOf("まで") !== -1) colEnd = c;
+    }
+    if (h.indexOf("ng乗客") !== -1 || h.indexOf("passenger") !== -1) colNgP = c;
+    if (h.indexOf("ngドライバー") !== -1 || h.indexOf("driver") !== -1) colNgD = c;
+  }
+  
+  for (var i = headerRowIdx + 1; i < conditionRows.length; i++) {
+    var cId = String(conditionRows[i][colId]).trim();
+    if (cId && userMap[cId]) {
+      userMap[cId].wheelchairType = conditionRows[i][colWhType] ? String(conditionRows[i][colWhType]).trim() : "一般席";
+      userMap[cId].timeStart = conditionRows[i][colStart] ? String(conditionRows[i][colStart]).trim() : "";
+      userMap[cId].timeEnd = conditionRows[i][colEnd] ? String(conditionRows[i][colEnd]).trim() : "";
+      userMap[cId].ngPassenger = conditionRows[i][colNgP] ? String(conditionRows[i][colNgP]).trim() : "";
+      userMap[cId].ngDriver = conditionRows[i][colNgD] ? String(conditionRows[i][colNgD]).trim() : "";
+    }
+  }
+  
+  function getLimitTime(baseDate, timeStr) {
+    if (!timeStr || timeStr === "" || timeStr === "undefined" || timeStr.indexOf("時間指定") !== -1) return null;
+    var d = new Date(baseDate.getTime());
+    var cleanStr = timeStr.replace(/[^0-9:]/g, ""); if (cleanStr.indexOf(":") === -1) return null;
+    var parts = cleanStr.split(':'); var hours = parseInt(parts[0], 10); var minutes = parseInt(parts[1], 10);
+    d.setHours(hours, minutes, 0, 0); return d;
+  }
+  
+  // ─── 車両マスタから「往路」の行だけを狙い撃ちで選別 ───
+  var vehicleRows = vehicleSheet.getDataRange().getDisplayValues();
+  var vehicles = [];
+  var vehicleRunCount = {}; // 車ごとの便数カウント用
+  
+  for (var i = 2; i < vehicleRows.length; i++) {
+    var vId = String(vehicleRows[i][0]).trim(); 
+    var vType = String(vehicleRows[i][9]).trim(); // J列：往復区分
+    
+    // 【重要】J列が「往路」の行だけをパズル対象にする
+    if (vId && vType === "往路" && (Number(vehicleRows[i][3]) > 0 || Number(vehicleRows[i][4]) > 0)) {
+      if (!vehicleRunCount[vId]) { vehicleRunCount[vId] = 1; } else { vehicleRunCount[vId]++; }
+      
+      vehicles.push({ 
+        id: vId, 
+        name: String(vehicleRows[i][1]).trim(), 
+        capacityRegular: Number(vehicleRows[i][3]), 
+        capacityWheelchair: Number(vehicleRows[i][4]), 
+        departureTimeStr: vehicleRows[i][7], 
+        returnLimitStr: vehicleRows[i][8],
+        tripName: vehicleRunCount[vId] + "便目" // 「1便目」「2便目」を自動命名
+      });
+    }
+  }
+  
+  function getDistance(lat1, lng1, lat2, lng2) {
+    return Math.sqrt(Math.pow((lng1 - lng2) * 91, 2) + Math.pow((lat1 - lat2) * 111, 2));
+  }
+  
+  var unassignedUsers = todayUserIds.filter(function(id) { return userMap[id]; });
+  unassignedUsers.sort(function(a, b) {
+    var timeA = userMap[a].timeEnd ? getLimitTime(targetDate, userMap[a].timeEnd) : null;
+    var timeB = userMap[b].timeEnd ? getLimitTime(targetDate, userMap[b].timeEnd) : null;
+    var tA = timeA ? timeA.getTime() : new Date(targetDate.getTime()).setHours(23,59,0,0);
+    var tB = timeB ? timeB.getTime() : new Date(targetDate.getTime()).setHours(23,59,0,0);
+    return tA - tB;
+  });
+  
+  var outputValues = [];
+  
+  for (var v = 0; v < vehicles.length; v++) {
+    var car = vehicles[v]; var currentLat = OFFICE_LAT; var currentLng = OFFICE_LNG;
+    var regularCount = 0; var wheelchairCount = 0; var stopOrder = 1;
+    var currentTime = getLimitTime(targetDate, car.departureTimeStr) || new Date(targetDate.getTime()).setHours(8, 15, 0, 0);
+    var myLineLimit = car.returnLimitStr !== "" ? getLimitTime(targetDate, car.returnLimitStr) : (v < vehicles.length - 1 && vehicles[v+1].id === car.id ? getLimitTime(targetDate, vehicles[v+1].departureTimeStr) : null);
+    
+    var currentRunUserIds = []; 
+    
+    while (unassignedUsers.length > 0) {
+      var nearestUserIdx = -1; var minDistance = 99999; var nextArrivalTime = null;
+      
+      // Mode A: 時間制限あり
+      for (var u = 0; u < unassignedUsers.length; u++) {
+        var uId = unassignedUsers[u]; var uInfo = userMap[uId];
+        if (!uInfo.timeEnd || !getLimitTime(targetDate, uInfo.timeEnd)) continue;
+        
+        var hasSeatCapacity = (uInfo.wheelchairType === "車椅子") ? (wheelchairCount < car.capacityWheelchair) : (regularCount < car.capacityRegular);
+        if (!hasSeatCapacity) continue;
+        
+        var dist = getDistance(currentLat, currentLng, uInfo.lat, uInfo.lng);
+        var tempArrivalTime = new Date(currentTime.getTime()); tempArrivalTime.setMinutes(tempArrivalTime.getMinutes() + Math.ceil(dist * 2) + 3);
+        
+        var limitStart = getLimitTime(targetDate, uInfo.timeStart); 
+        if (limitStart) {
+          var waitMinutes = (limitStart.getTime() - tempArrivalTime.getTime()) / (1000 * 60);
+          if (waitMinutes > MAX_WAIT_MINUTES) continue; 
+          if (tempArrivalTime < limitStart) tempArrivalTime = limitStart; 
+        }
+        
+        var isTimeOk = (tempArrivalTime <= getLimitTime(targetDate, uInfo.timeEnd));
+        var isReturnOk = true;
+        if (myLineLimit) {
+          var tempReturnTime = new Date(tempArrivalTime.getTime()); tempReturnTime.setMinutes(tempReturnTime.getMinutes() + Math.ceil(getDistance(uInfo.lat, uInfo.lng, OFFICE_LAT, OFFICE_LNG) * 2) + 3);
+          if (tempReturnTime > myLineLimit) isReturnOk = false;
+        }
+        
+        if (isTimeOk && isReturnOk && dist < minDistance) { 
+          minDistance = dist; nearestUserIdx = u; nextArrivalTime = tempArrivalTime; 
+        }
+      }
+      
+      // Mode B: フリー（最終救済）
+      if (nearestUserIdx === -1) {
+        for (var u = 0; u < unassignedUsers.length; u++) {
+          var uId = unassignedUsers[u]; var uInfo = userMap[uId];
+          var hasSeatCapacity = (uInfo.wheelchairType === "車椅子") ? (wheelchairCount < car.capacityWheelchair) : (regularCount < car.capacityRegular);
+          if (!hasSeatCapacity) continue;
+          
+          var dist = getDistance(currentLat, currentLng, uInfo.lat, uInfo.lng);
+          var tempArrivalTime = new Date(currentTime.getTime()); tempArrivalTime.setMinutes(tempArrivalTime.getMinutes() + Math.ceil(dist * 2) + 3);
+          
+          var limitStart = getLimitTime(targetDate, uInfo.timeStart); 
+          if (limitStart && tempArrivalTime < limitStart) tempArrivalTime = limitStart;
+          
+          var isReturnOk = true;
+          if (myLineLimit) {
+            var tempReturnTime = new Date(tempArrivalTime.getTime()); tempReturnTime.setMinutes(tempReturnTime.getMinutes() + Math.ceil(getDistance(uInfo.lat, uInfo.lng, OFFICE_LAT, OFFICE_LNG) * 2) + 3);
+            if (tempReturnTime > myLineLimit) isReturnOk = false;
+          }
+          if (isReturnOk && dist < minDistance) { minDistance = dist; nearestUserIdx = u; nextArrivalTime = tempArrivalTime; }
+        }
+      }
+      
+      if (nearestUserIdx !== -1) {
+        var assignedId = unassignedUsers[nearestUserIdx]; var assignedInfo = userMap[assignedId];
+        if (assignedInfo.wheelchairType === "車椅子") { wheelchairCount++; } else { regularCount++; }
+        currentTime = nextArrivalTime;
+        currentRunUserIds.push(assignedId); 
+        
+        var displayName = assignedInfo.name;
+        if (assignedInfo.wheelchairType === "車椅子") displayName += " ♿";
+        else if (assignedInfo.wheelchairType === "助手席") displayName += " 💺";
+        
+        // ★【列ズレ修正】D列に「1便目」等の便名、E列に「回る順番」を寸分違わず美しく格納！
+        outputValues.push([targetDate, car.id, car.name, car.tripName, stopOrder, "往路", "", assignedId, displayName, Utilities.formatDate(currentTime, "JST", "HH:mm")]);
+        currentLat = assignedInfo.lat; currentLng = assignedInfo.lng; stopOrder++;
+        unassignedUsers.splice(nearestUserIdx, 1);
+      } else { break; }
+    }
+    if (stopOrder > 1) {
+      currentTime.setMinutes(currentTime.getMinutes() + Math.ceil(getDistance(currentLat, currentLng, OFFICE_LAT, OFFICE_LNG) * 2) + 3);
+      outputValues.push([targetDate, car.id, car.name, car.tripName, stopOrder, "往路", "", "🏢 OFFICE", "ーーー 施設に帰着 ーーー", Utilities.formatDate(currentTime, "JST", "HH:mm")]);
+    }
+  }
+  
+  if (outputValues.length > 0) {
+    var lastRow = outputSheet.getLastRow();
+    var keepValues = [];
+    if (lastRow >= 3) {
+      var outData = outputSheet.getRange(3, 1, lastRow - 2, 10).getValues();
+      for (var i = 0; i < outData.length; i++) {
+        if (outData[i][5] !== "往路") keepValues.push(outData[i]); // 復路を救出して退避
+      }
+      outputSheet.getRange(3, 1, lastRow - 2, 10).clearContent(); 
+    }
+    if (outputValues.length > 0) {
+      outputSheet.getRange(3, 1, outputValues.length, 10).setValues(outputValues);
+    }
+    if (keepValues.length > 0) {
+      outputSheet.getRange(3 + outputValues.length, 1, keepValues.length, 10).setValues(keepValues);
+    }
+    Browser.msgBox("完了", "【V7決定版：往路配車完了】J列マスタと連動し、ルートを完全出力しました！", Browser.Buttons.OK);
+  }
+}
+// ==========================================================
+// 機能4：【復路（夕方の送り）】AI自動配車（V9：昼便ガード＆暴走セーフティ撤去・最終完成版）
+// ==========================================================
+function runAiDropoffRoutingV7() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var attendanceSheet = ss.getSheetByName("t_daily_attendance");
   var basicSheet = ss.getSheetByName("m_user_basics");
@@ -184,7 +410,7 @@ function runAiRouting() {
   for (var i = 2; i < basicData.length; i++) {
     var uId = String(basicData[i][0]).trim();
     if (uId && uId !== "") {
-      userMap[uId] = { name: basicData[i][1], lat: Number(basicData[i][4]), lng: Number(basicData[i][5]), timeStart: null, timeEnd: null, wheelchairType: "一般席", ngPassenger: "", ngDriver: "", dropoffTimeEnd: null };
+      userMap[uId] = { name: basicData[i][1], lat: Number(basicData[i][4]), lng: Number(basicData[i][5]), wheelchairType: "一般席", dropoffTime: "" };
     }
   }
   
@@ -193,47 +419,71 @@ function runAiRouting() {
   for (var r = 0; r < 2; r++) {
     if (conditionRows[r].join("").indexOf("ID") !== -1 || conditionRows[r].join("").indexOf("id") !== -1) { headers = conditionRows[r]; headerRowIdx = r; break; }
   }
-  var colId = 0, colWhType = 2, colStart = 3, colEnd = 4, colNgP = 5, colNgD = 6, colDropEnd = 7;
+  
+  var colId = 0, colWhType = 2, colDropTime = -1;
   for (var c = 0; c < headers.length; c++) {
     var h = String(headers[c]).trim().toLowerCase();
-    if (h.indexOf("id") !== -1) colId = c;
-    if (h.indexOf("車椅子") !== -1 || h.indexOf("wheelchair") !== -1) colWhType = c;
-    if (h.indexOf("往路開始") !== -1 || h.indexOf("start") !== -1) colStart = c;
-    if (h.indexOf("往路終了") !== -1 || h.indexOf("end") !== -1) colEnd = c;
-    if (h.indexOf("ng乗客") !== -1 || h.indexOf("passenger") !== -1) colNgP = c;
-    if (h.indexOf("ngドライバー") !== -1 || h.indexOf("driver") !== -1) colNgD = c;
-    if (h.indexOf("復路終了") !== -1 || h.indexOf("dropoff") !== -1 || h.indexOf("届けて") !== -1) colDropEnd = c;
+    if (h.indexOf("id") !== -1 && h.indexOf("vehicle") === -1 && h.indexOf("driver") === -1 && h.indexOf("passenger") === -1) colId = c;
+    if (h.indexOf("車椅子") !== -1 || h.indexOf("wheelchair") !== -1 || h.indexOf("区分") !== -1) colWhType = c;
+    
+    if (h.indexOf("dropoff") !== -1 || h.indexOf("復路") !== -1 || h.indexOf("送り") !== -1) {
+      if ((h.indexOf("希望") !== -1 || h.indexOf("時間") !== -1 || h.indexOf("time") !== -1 || h.indexOf("start") !== -1) && colDropTime === -1) { 
+        colDropTime = c; 
+      }
+    }
   }
+  if (colDropTime === -1) colDropTime = 5; 
   
   for (var i = headerRowIdx + 1; i < conditionRows.length; i++) {
     var cId = String(conditionRows[i][colId]).trim();
     if (cId && userMap[cId]) {
       userMap[cId].wheelchairType = conditionRows[i][colWhType] ? String(conditionRows[i][colWhType]).trim() : "一般席";
-      userMap[cId].timeStart = conditionRows[i][colStart] ? conditionRows[i][colStart].trim() : null;
-      userMap[cId].timeEnd = conditionRows[i][colEnd] ? conditionRows[i][colEnd].trim() : null;
-      userMap[cId].ngPassenger = conditionRows[i][colNgP] ? conditionRows[i][colNgP].trim() : "";
-      userMap[cId].ngDriver = conditionRows[i][colNgD] ? conditionRows[i][colNgD].trim() : "";
-      userMap[cId].dropoffTimeEnd = conditionRows[i][colDropEnd] ? conditionRows[i][colDropEnd].trim() : null;
+      userMap[cId].dropoffTime = conditionRows[i][colDropTime] ? String(conditionRows[i][colDropTime]).trim() : "";
     }
   }
   
   function getLimitTime(baseDate, timeStr) {
-    if (!timeStr) return null;
+    if (!timeStr || timeStr === "" || timeStr === "undefined" || timeStr.indexOf("時間指定") !== -1) return null;
     var d = new Date(baseDate.getTime());
-    var isPm = (timeStr.indexOf("午後") !== -1 || timeStr.toLowerCase().indexOf("pm") !== -1);
     var cleanStr = timeStr.replace(/[^0-9:]/g, ""); if (cleanStr.indexOf(":") === -1) return null;
     var parts = cleanStr.split(':'); var hours = parseInt(parts[0], 10); var minutes = parseInt(parts[1], 10);
-    if (isPm && hours < 12) hours += 12;
     d.setHours(hours, minutes, 0, 0); return d;
   }
   
   var vehicleRows = vehicleSheet.getDataRange().getDisplayValues();
-  var vehicles = [];
+  var vehicleHeaders = vehicleRows[0];
+  var colVDeparture = 7; 
+  for (var c = 0; c < vehicleHeaders.length; c++) {
+    var vh = String(vehicleHeaders[c]).toLowerCase();
+    if ((vh.indexOf("復路") !== -1 || vh.indexOf("夕方") !== -1 || vh.indexOf("送り") !== -1 || vh.indexOf("dropoff") !== -1) && 
+        (vh.indexOf("出発") !== -1 || vh.indexOf("start") !== -1 || vh.indexOf("time") !== -1)) {
+      colVDeparture = c;
+      break;
+    }
+  }
+  
+  var tempVehicles = [];
   for (var i = 2; i < vehicleRows.length; i++) {
     var vId = String(vehicleRows[i][0]).trim(); 
-    if (vId && (Number(vehicleRows[i][3]) > 0 || Number(vehicleRows[i][4]) > 0)) {
-      vehicles.push({ id: vId, name: String(vehicleRows[i][1]).trim(), capacityRegular: Number(vehicleRows[i][3]), capacityWheelchair: Number(vehicleRows[i][4]), departureTimeStr: vehicleRows[i][7], returnLimitStr: vehicleRows[i][8] });
+    var vType = String(vehicleRows[i][9]).trim(); 
+    if (vId && vType === "復路" && (Number(vehicleRows[i][3]) > 0 || Number(vehicleRows[i][4]) > 0)) {
+      tempVehicles.push({ id: vId, name: String(vehicleRows[i][1]).trim(), capacityRegular: Number(vehicleRows[i][3]), capacityWheelchair: Number(vehicleRows[i][4]), departureTimeStr: vehicleRows[i][colVDeparture] });
     }
+  }
+  
+  // 出発時間が「早い順」にタイムラインをソート
+  tempVehicles.sort(function(a, b) {
+    var timeA = getLimitTime(targetDate, a.departureTimeStr); var timeB = getLimitTime(targetDate, b.departureTimeStr);
+    var tA = timeA ? timeA.getTime() : 0; var tB = timeB ? timeB.getTime() : 0;
+    return tA - tB;
+  });
+  
+  var vehicles = []; var vehicleRunCount = {};
+  for (var v = 0; v < tempVehicles.length; v++) {
+    var car = tempVehicles[v];
+    if (!vehicleRunCount[car.id]) { vehicleRunCount[car.id] = 1; } else { vehicleRunCount[car.id]++; }
+    car.tripName = vehicleRunCount[car.id] + "便目";
+    vehicles.push(car);
   }
   
   function getDistance(lat1, lng1, lat2, lng2) {
@@ -241,81 +491,86 @@ function runAiRouting() {
   }
   
   var unassignedUsers = todayUserIds.filter(function(id) { return userMap[id]; });
-  unassignedUsers.sort(function(a, b) {
-    var timeA = userMap[a].timeEnd ? getLimitTime(targetDate, userMap[a].timeEnd).getTime() : new Date(targetDate.getTime()).setHours(23,59,0,0);
-    var timeB = userMap[b].timeEnd ? getLimitTime(targetDate, userMap[b].timeEnd).getTime() : new Date(targetDate.getTime()).setHours(23,59,0,0);
-    return timeA - timeB;
-  });
-  
   var outputValues = [];
   
   for (var v = 0; v < vehicles.length; v++) {
     var car = vehicles[v]; var currentLat = OFFICE_LAT; var currentLng = OFFICE_LNG;
     var regularCount = 0; var wheelchairCount = 0; var stopOrder = 1;
-    var currentTime = getLimitTime(targetDate, car.departureTimeStr) || new Date(targetDate.getTime()).setHours(8, 15, 0, 0);
-    var myLineLimit = car.returnLimitStr !== "" ? getLimitTime(targetDate, car.returnLimitStr) : (v < vehicles.length - 1 && vehicles[v+1].id === car.id ? getLimitTime(targetDate, vehicles[v+1].departureTimeStr) : null);
-    
+    var currentTime = getLimitTime(targetDate, car.departureTimeStr) || new Date(targetDate.getTime()).setHours(15, 30, 0, 0);
     var currentRunUserIds = []; 
     
     while (unassignedUsers.length > 0) {
-      var nearestUserIdx = -1; var minDistance = 99999; var nextArrivalTime = null;
+      var nearestUserIdx = -1; var bestScore = -1; var minDistance = 99999; var nextArrivalTime = null;
       
-      // Mode A: 時間制限あり
+      // Mode A: 希望時間5分前後にジャストフィットする人を探索
       for (var u = 0; u < unassignedUsers.length; u++) {
         var uId = unassignedUsers[u]; var uInfo = userMap[uId];
-        if (!uInfo.timeEnd) break;
         
         var hasSeatCapacity = (uInfo.wheelchairType === "車椅子") ? (wheelchairCount < car.capacityWheelchair) : (regularCount < car.capacityRegular);
         if (!hasSeatCapacity) continue;
         
-        // ⭐【修正】NGドライバーの完全一致チェック（スペース無視）
-        if (uInfo.ngDriver && uInfo.ngDriver !== "") {
-          var cleanedNgD = cleanStringForMatch(uInfo.ngDriver);
-          if (cleanStringForMatch(car.name) === cleanedNgD || cleanStringForMatch(car.id) === cleanedNgD) continue;
-        }
-        if (checkNgPassengerConflict(uId, uInfo, currentRunUserIds, userMap)) continue;
+        // 🚨【現場ルール】15:00前の「昼便」の場合、希望なし(空欄)の人は夕方まで残るため、昼便の選択肢から完全除外！
+        var carDepartureTime = getLimitTime(targetDate, car.departureTimeStr);
+        var isLunchCar = carDepartureTime && carDepartureTime.getHours() < 15;
+        if (isLunchCar && (!uInfo.dropoffTime || String(uInfo.dropoffTime).trim() === "")) continue;
         
         var dist = getDistance(currentLat, currentLng, uInfo.lat, uInfo.lng);
         var tempArrivalTime = new Date(currentTime.getTime()); tempArrivalTime.setMinutes(tempArrivalTime.getMinutes() + Math.ceil(dist * 2) + 3);
-        var limitStart = getLimitTime(targetDate, uInfo.timeStart); if (limitStart && tempArrivalTime < limitStart) tempArrivalTime = limitStart;
         
-        var isTimeOk = (tempArrivalTime <= getLimitTime(targetDate, uInfo.timeEnd));
-        var isReturnOk = true;
-        if (myLineLimit) {
-          var tempReturnTime = new Date(tempArrivalTime.getTime()); tempReturnTime.setMinutes(tempReturnTime.getMinutes() + Math.ceil(getDistance(uInfo.lat, uInfo.lng, OFFICE_LAT, OFFICE_LNG) * 2) + 3);
-          if (tempReturnTime > myLineLimit) isReturnOk = false;
+        var currentScore = 0;
+        
+        if (uInfo.dropoffTime && getLimitTime(targetDate, uInfo.dropoffTime)) {
+          var targetTime = getLimitTime(targetDate, uInfo.dropoffTime);
+          var limitStart = new Date(targetTime.getTime()); limitStart.setMinutes(limitStart.getMinutes() - 5); 
+          var limitEnd = new Date(targetTime.getTime()); limitEnd.setMinutes(limitEnd.getMinutes() + 5);     
+          
+          if (tempArrivalTime >= limitStart && tempArrivalTime <= limitEnd) {
+            currentScore = 3000 - dist; 
+          } else if (tempArrivalTime < limitStart) {
+            currentScore = 0; 
+          } else {
+            currentScore = -100; 
+          }
+        } else {
+          currentScore = 1000 - dist;
         }
-        if (isTimeOk && isReturnOk) { nearestUserIdx = u; nextArrivalTime = tempArrivalTime; break; }
+        
+        if (currentScore > 0 && currentScore > bestScore) {
+          bestScore = currentScore; nearestUserIdx = u; nextArrivalTime = tempArrivalTime;
+        }
       }
       
-      // Mode B: フリー
+      // Mode B: フリー枠（最終救済）
       if (nearestUserIdx === -1) {
         for (var u = 0; u < unassignedUsers.length; u++) {
           var uId = unassignedUsers[u]; var uInfo = userMap[uId];
-          if (uInfo.timeEnd) continue;
           
           var hasSeatCapacity = (uInfo.wheelchairType === "車椅子") ? (wheelchairCount < car.capacityWheelchair) : (regularCount < car.capacityRegular);
           if (!hasSeatCapacity) continue;
           
-          // ⭐【修正】NGドライバーの完全一致チェック
-          if (uInfo.ngDriver && uInfo.ngDriver !== "") {
-            var cleanedNgD = cleanStringForMatch(uInfo.ngDriver);
-            if (cleanStringForMatch(car.name) === cleanedNgD || cleanStringForMatch(car.id) === cleanedNgD) continue;
-          }
-          if (checkNgPassengerConflict(uId, uInfo, currentRunUserIds, userMap)) continue;
+          // 🚨【現場ルール】昼便には、希望なしの人は乗せない
+          var carDepartureTime = getLimitTime(targetDate, car.departureTimeStr);
+          var isLunchCar = carDepartureTime && carDepartureTime.getHours() < 15;
+          if (isLunchCar && (!uInfo.dropoffTime || String(uInfo.dropoffTime).trim() === "")) continue;
           
           var dist = getDistance(currentLat, currentLng, uInfo.lat, uInfo.lng);
           var tempArrivalTime = new Date(currentTime.getTime()); tempArrivalTime.setMinutes(tempArrivalTime.getMinutes() + Math.ceil(dist * 2) + 3);
-          var limitStart = getLimitTime(targetDate, uInfo.timeStart); if (limitStart && tempArrivalTime < limitStart) tempArrivalTime = limitStart;
           
-          var isReturnOk = true;
-          if (myLineLimit) {
-            var tempReturnTime = new Date(tempArrivalTime.getTime()); tempReturnTime.setMinutes(tempReturnTime.getMinutes() + Math.ceil(getDistance(uInfo.lat, uInfo.lng, OFFICE_LAT, OFFICE_LNG) * 2) + 3);
-            if (tempReturnTime > myLineLimit) isReturnOk = false;
+          if (uInfo.dropoffTime && getLimitTime(targetDate, uInfo.dropoffTime)) {
+            var targetTime = getLimitTime(targetDate, uInfo.dropoffTime);
+            
+            if (targetTime < carDepartureTime) continue;
+            
+            var limitStartBuffer = new Date(targetTime.getTime()); limitStartBuffer.setMinutes(limitStartBuffer.getMinutes() - 30);
+            if (tempArrivalTime < limitStartBuffer) continue;
           }
-          if (isReturnOk && dist < minDistance) { minDistance = dist; nearestUserIdx = u; nextArrivalTime = tempArrivalTime; }
+          
+          if (dist < minDistance) { minDistance = dist; nearestUserIdx = u; nextArrivalTime = tempArrivalTime; }
         }
       }
+      
+      // ⚠️【大改造】暴走誘拐セーフティブロックを完全撤去！
+      // 誰も該当者がいなければ、無理に誰かを乗せずに即座にbreakして施設へ帰着させます。
       
       if (nearestUserIdx !== -1) {
         var assignedId = unassignedUsers[nearestUserIdx]; var assignedInfo = userMap[assignedId];
@@ -327,244 +582,79 @@ function runAiRouting() {
         if (assignedInfo.wheelchairType === "車椅子") displayName += " ♿";
         else if (assignedInfo.wheelchairType === "助手席") displayName += " 💺";
         
-        outputValues.push([targetDate, car.id, car.name, "", "", "往路", stopOrder, assignedId, displayName, Utilities.formatDate(currentTime, "JST", "HH:mm")]);
+        outputValues.push([targetDate, car.id, car.name, car.tripName, stopOrder, "復路", "", assignedId, displayName, Utilities.formatDate(currentTime, "JST", "HH:mm")]);
         currentLat = assignedInfo.lat; currentLng = assignedInfo.lng; stopOrder++;
         unassignedUsers.splice(nearestUserIdx, 1);
       } else { break; }
     }
     if (stopOrder > 1) {
       currentTime.setMinutes(currentTime.getMinutes() + Math.ceil(getDistance(currentLat, currentLng, OFFICE_LAT, OFFICE_LNG) * 2) + 3);
-      outputValues.push([targetDate, car.id, car.name, "", "", "往路", stopOrder, "🏢 OFFICE", "ーーー 施設に帰着 ーーー", Utilities.formatDate(currentTime, "JST", "HH:mm")]);
+      outputValues.push([targetDate, car.id, car.name, car.tripName, stopOrder, "復路", "", "🏢 OFFICE", "ーーー 施設に帰着 ーーー", Utilities.formatDate(currentTime, "JST", "HH:mm")]);
     }
   }
   
   if (outputValues.length > 0) {
     var lastRow = outputSheet.getLastRow();
-    if (lastRow >= 3) outputSheet.getRange(3, 1, lastRow - 2, outputSheet.getLastColumn() || 10).clearContent();
-    outputSheet.getRange(3, 1, outputValues.length, 10).setValues(outputValues);
-    var msg = "【AI配車完了】 最新の往路ルートに上書きしました！";
-    if (unassignedUsers.length > 0) {
-      var unassignedNames = unassignedUsers.map(function(id) { return " ・ " + (userMap[id] ? userMap[id].name : id); }).join("\n");
-      msg += "\n\n⚠️ 【ルートが組めなかった人: " + unassignedUsers.length + "名】\n" + unassignedNames;
+    var keepValues = [];
+    if (lastRow >= 3) {
+      var outData = outputSheet.getRange(3, 1, lastRow - 2, 10).getValues();
+      for (var i = 0; i < outData.length; i++) {
+        if (outData[i][5] !== "復路") keepValues.push(outData[i]); 
+      }
+      outputSheet.getRange(3, 1, lastRow - 2, 10).clearContent(); 
     }
-    Browser.msgBox("完了", msg, Browser.Buttons.OK);
+    if (keepValues.length > 0) {
+      outputSheet.getRange(3, 1, keepValues.length, 10).setValues(keepValues);
+    }
+    outputSheet.getRange(3 + keepValues.length, 1, outputValues.length, 10).setValues(outputValues);
+    
+    Browser.msgBox("完了", "【V9最終完成版：復路時系列配車完了】昼の臨時便と、夕方の定期送り便が完全に仕分けられました！", Browser.Buttons.OK);
   }
 }
-
 // ==========================================
-// 機能4：【復路（夕方のお送り）】AI自動配車
-// ==========================================
-function runAiRoutingReturn() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var attendanceSheet = ss.getSheetByName("t_daily_attendance");
-  var basicSheet = ss.getSheetByName("m_user_basics");
-  var vehicleSheet = ss.getSheetByName("m_vehicles");
-  var conditionSheet = ss.getSheetByName("t_user_pickup_conditions"); 
-  var outputSheet = ss.getSheetByName("t_routing_outputs");
-  
-  var targetDate = attendanceSheet.getRange("H1").getValue();
-  var officeLat = attendanceSheet.getRange("H2").getValue(); var officeLng = attendanceSheet.getRange("H3").getValue(); 
-  if (!targetDate || !(targetDate instanceof Date)) return;
-  
-  var OFFICE_LAT = Number(officeLat); var OFFICE_LNG = Number(officeLng);
-  var attendanceData = attendanceSheet.getDataRange().getValues();
-  var todayUserIds = [];
-  for (var i = 2; i < attendanceData.length; i++) {
-    var rowDate = attendanceData[i][0]; var userId = String(attendanceData[i][1]).trim();
-    if (rowDate instanceof Date && rowDate.getTime() === targetDate.getTime() && userId && attendanceData[i][3] !== "欠席") {
-      todayUserIds.push(userId);
-    }
-  }
-  
-  if (todayUserIds.length === 0) return;
-  
-  var basicData = basicSheet.getDataRange().getValues();
-  var userMap = {};
-  for (var i = 2; i < basicData.length; i++) {
-    var uId = String(basicData[i][0]).trim();
-    if (uId && uId !== "") userMap[uId] = { name: basicData[i][1], lat: Number(basicData[i][4]), lng: Number(basicData[i][5]), wheelchairType: "一般席", ngPassenger: "", ngDriver: "", dropoffTimeEnd: null };
-  }
-  
-  var conditionRows = conditionSheet.getDataRange().getDisplayValues();
-  var headers = conditionRows[0]; var headerRowIdx = 0;
-  for (var r = 0; r < 2; r++) {
-    if (conditionRows[r].join("").indexOf("ID") !== -1 || conditionRows[r].join("").indexOf("id") !== -1) { headers = conditionRows[r]; headerRowIdx = r; break; }
-  }
-  var colId = 0, colWhType = 2, colNgP = 5, colNgD = 6, colDropEnd = 7;
-  for (var c = 0; c < headers.length; c++) {
-    var h = String(headers[c]).trim().toLowerCase();
-    if (h.indexOf("id") !== -1) colId = c;
-    if (h.indexOf("車椅子") !== -1 || h.indexOf("wheelchair") !== -1) colWhType = c;
-    if (h.indexOf("ng乗客") !== -1 || h.indexOf("passenger") !== -1) colNgP = c;
-    if (h.indexOf("ngドライバー") !== -1 || h.indexOf("driver") !== -1) colNgD = c;
-    if (h.indexOf("復路終了") !== -1 || h.indexOf("dropoff") !== -1 || h.indexOf("届けて") !== -1) colDropEnd = c;
-  }
-  
-  for (var i = headerRowIdx + 1; i < conditionRows.length; i++) {
-    var cId = String(conditionRows[i][colId]).trim();
-    if (cId && userMap[cId]) {
-      userMap[cId].wheelchairType = conditionRows[i][colWhType] ? String(conditionRows[i][colWhType]).trim() : "一般席";
-      userMap[cId].ngPassenger = conditionRows[i][colNgP] ? conditionRows[i][colNgP].trim() : "";
-      userMap[cId].ngDriver = conditionRows[i][colNgD] ? conditionRows[i][colNgD].trim() : "";
-      userMap[cId].dropoffTimeEnd = conditionRows[i][colDropEnd] ? conditionRows[i][colDropEnd].trim() : null;
-    }
-  }
-  
-  function getLimitTime(baseDate, timeStr) {
-    if (!timeStr || timeStr === "") return null;
-    var d = new Date(baseDate.getTime());
-    var cleanStr = timeStr.replace(/[^0-9:]/g, ""); if (cleanStr.indexOf(":") === -1) return null;
-    var parts = cleanStr.split(':'); d.setHours(parseInt(parts[0], 10), parseInt(parts[1], 10), 0, 0); return d;
-  }
-  
-  var vehicleRows = vehicleSheet.getDataRange().getDisplayValues();
-  var vehicles = [];
-  for (var i = 2; i < vehicleRows.length; i++) {
-    var vId = String(vehicleRows[i][0]).trim(); 
-    if (vId && (Number(vehicleRows[i][3]) > 0 || Number(vehicleRows[i][4]) > 0)) {
-      vehicles.push({ id: vId, name: String(vehicleRows[i][1]).trim(), capacityRegular: Number(vehicleRows[i][3]), capacityWheelchair: Number(vehicleRows[i][4]), returnDepartureTimeStr: vehicleRows[i][9] });
-    }
-  }
-  
-  function getDistance(lat1, lng1, lat2, lng2) {
-    return Math.sqrt(Math.pow((lng1 - lng2) * 91, 2) + Math.pow((lat1 - lat2) * 111, 2));
-  }
-  
-  var unassignedUsers = todayUserIds.filter(function(id) { return userMap[id]; });
-  
-  unassignedUsers.sort(function(a, b) {
-    var timeA = userMap[a].dropoffTimeEnd ? getLimitTime(targetDate, userMap[a].dropoffTimeEnd).getTime() : new Date(targetDate.getTime()).setHours(23,59,0,0);
-    var timeB = userMap[b].dropoffTimeEnd ? getLimitTime(targetDate, userMap[b].dropoffTimeEnd).getTime() : new Date(targetDate.getTime()).setHours(23,59,0,0);
-    return timeA - timeB;
-  });
-  
-  var outputValues = [];
-  
-  for (var v = 0; v < vehicles.length; v++) {
-    var car = vehicles[v]; var currentLat = OFFICE_LAT; var currentLng = OFFICE_LNG;
-    var regularCount = 0; var wheelchairCount = 0; var stopOrder = 1;
-    var currentTime = getLimitTime(targetDate, car.returnDepartureTimeStr);
-    var myLineLimit = (v < vehicles.length - 1 && vehicles[v+1].id === car.id) ? getLimitTime(targetDate, vehicles[v+1].returnDepartureTimeStr) : null;
-    
-    var currentRunUserIds = []; 
-    
-    while (unassignedUsers.length > 0) {
-      var nearestUserIdx = -1; var minDistance = 99999; var nextArrivalTime = null;
-      
-      // 復路・Mode A
-      for (var u = 0; u < unassignedUsers.length; u++) {
-        var uId = unassignedUsers[u]; var uInfo = userMap[uId];
-        if (!uInfo.dropoffTimeEnd) break; 
-        
-        var hasSeatCapacity = (uInfo.wheelchairType === "車椅子") ? (wheelchairCount < car.capacityWheelchair) : (regularCount < car.capacityRegular);
-        if (!hasSeatCapacity) continue;
-        
-        // ⭐【修正】NGドライバーの完全一致チェック
-        if (uInfo.ngDriver && uInfo.ngDriver !== "") {
-          var cleanedNgD = cleanStringForMatch(uInfo.ngDriver);
-          if (cleanStringForMatch(car.name) === cleanedNgD || cleanStringForMatch(car.id) === cleanedNgD) continue;
-        }
-        if (checkNgPassengerConflict(uId, uInfo, currentRunUserIds, userMap)) continue;
-        
-        var dist = getDistance(currentLat, currentLng, uInfo.lat, uInfo.lng);
-        var tempArrivalTime = new Date(currentTime.getTime()); tempArrivalTime.setMinutes(tempArrivalTime.getMinutes() + Math.ceil(dist * 2) + 3);
-        
-        var isTimeOk = (tempArrivalTime <= getLimitTime(targetDate, uInfo.dropoffTimeEnd));
-        var isReturnOk = true;
-        if (myLineLimit) {
-          var tempReturnTime = new Date(tempArrivalTime.getTime()); tempReturnTime.setMinutes(tempReturnTime.getMinutes() + Math.ceil(getDistance(uInfo.lat, uInfo.lng, OFFICE_LAT, OFFICE_LNG) * 2) + 3);
-          if (tempReturnTime > myLineLimit) isReturnOk = false;
-        }
-        if (isTimeOk && isReturnOk) { nearestUserIdx = u; nextArrivalTime = tempArrivalTime; break; }
-      }
-      
-      // 復路・Mode B
-      if (nearestUserIdx === -1) {
-        for (var u = 0; u < unassignedUsers.length; u++) {
-          var uId = unassignedUsers[u]; var uInfo = userMap[uId];
-          if (uInfo.dropoffTimeEnd) continue; 
-          
-          var hasSeatCapacity = (uInfo.wheelchairType === "車椅子") ? (wheelchairCount < car.capacityWheelchair) : (regularCount < car.capacityRegular);
-          if (!hasSeatCapacity) continue;
-          
-          // ⭐【修正】NGドライバーの完全一致チェック
-          if (uInfo.ngDriver && uInfo.ngDriver !== "") {
-            var cleanedNgD = cleanStringForMatch(uInfo.ngDriver);
-            if (cleanStringForMatch(car.name) === cleanedNgD || cleanStringForMatch(car.id) === cleanedNgD) continue;
-          }
-          if (checkNgPassengerConflict(uId, uInfo, currentRunUserIds, userMap)) continue;
-          
-          var dist = getDistance(currentLat, currentLng, uInfo.lat, uInfo.lng);
-          var tempArrivalTime = new Date(currentTime.getTime()); tempArrivalTime.setMinutes(tempArrivalTime.getMinutes() + Math.ceil(dist * 2) + 3);
-          
-          var isReturnOk = true;
-          if (myLineLimit) {
-            var tempReturnTime = new Date(tempArrivalTime.getTime()); tempReturnTime.setMinutes(tempReturnTime.getMinutes() + Math.ceil(getDistance(uInfo.lat, uInfo.lng, OFFICE_LAT, OFFICE_LNG) * 2) + 3);
-            if (tempReturnTime > myLineLimit) isReturnOk = false;
-          }
-          if (isReturnOk && dist < minDistance) { minDistance = dist; nearestUserIdx = u; nextArrivalTime = tempArrivalTime; }
-        }
-      }
-      
-      if (nearestUserIdx !== -1) {
-        var assignedId = unassignedUsers[nearestUserIdx]; var assignedInfo = userMap[assignedId];
-        if (assignedInfo.wheelchairType === "車椅子") { wheelchairCount++; } else { regularCount++; }
-        currentTime = nextArrivalTime;
-        currentRunUserIds.push(assignedId); 
-        
-        var displayName = assignedInfo.name;
-        if (assignedInfo.wheelchairType === "車椅子") displayName += " ♿";
-        else if (assignedInfo.wheelchairType === "助手席") displayName += " 💺";
-        
-        outputValues.push([targetDate, car.id, car.name, "", "", "復路", stopOrder, assignedId, displayName, Utilities.formatDate(currentTime, "JST", "HH:mm")]);
-        currentLat = assignedInfo.lat; currentLng = assignedInfo.lng; stopOrder++;
-        unassignedUsers.splice(nearestUserIdx, 1);
-      } else { break; }
-    }
-    if (stopOrder > 1) {
-      currentTime.setMinutes(currentTime.getMinutes() + Math.ceil(getDistance(currentLat, currentLng, OFFICE_LAT, OFFICE_LNG) * 2) + 3);
-      outputValues.push([targetDate, car.id, car.name, "", "", "復路", stopOrder, "🏢 OFFICE", "ーーー 施設に帰着 ーーー", Utilities.formatDate(currentTime, "JST", "HH:mm")]);
-    }
-  }
-  
-  if (outputValues.length > 0) {
-    var startRow = (outputSheet.getLastRow() < 3) ? 3 : outputSheet.getLastRow() + 1;
-    outputSheet.getRange(startRow, 1, outputValues.length, 10).setValues(outputValues);
-    var msg = "【AI復路配車完了】 夕方の送りルートを往路の下に追記しました！";
-    if (unassignedUsers.length > 0) {
-      var unassignedNames = unassignedUsers.map(function(id) { return " ・ " + (userMap[id] ? userMap[id].name : id); }).join("\n");
-      msg += "\n\n⚠️ 【送りきれなかった人: " + unassignedUsers.length + "名】\n" + unassignedNames;
-    }
-    Browser.msgBox("完了", msg, Browser.Buttons.OK);
-  }
-}
-
-// ==========================================
-// 機能5：【マスタ自動化】住所 ➔ 緯度経度一発変換
+// 機能5：【マスタ自動化】住所 ➔ 緯度経度・マップ絵文字リンク一発変換
 // ==========================================
 function convertAddressToLatLng() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet(); var basicSheet = ss.getSheetByName("m_user_basics"); if (!basicSheet) return;
+  var ss = SpreadsheetApp.getActiveSpreadsheet(); 
+  var basicSheet = ss.getSheetByName("m_user_basics"); 
+  if (!basicSheet) return;
+  
   var basicData = basicSheet.getDataRange().getValues();
   var successCount = 0;
+  
   for (var i = 2; i < basicData.length; i++) {
     var address = basicData[i][3] ? String(basicData[i][3]).trim() : ""; 
     var currentLat = basicData[i][4];
     var currentLng = basicData[i][5];
     
-    // ⭐【修正】緯度か経度の「どちらか片方でも」空文字（空欄）なら、確実に再取得を走らせる
+    // 【修正】緯度か経度の「どちらか片方でも」空文字（空欄）なら、確実に再取得を走らせる
     if (address && address !== "" && (currentLat === "" || currentLng === "")) {
       try {
         var response = Maps.newGeocoder().geocode(address);
         if (response.status === "OK" && response.results && response.results.length > 0) {
           var loc = response.results[0].geometry.location;
+          
+          // 1. 緯度と経度を書き込み（5列目＝E列、6列目＝F列）
           basicSheet.getRange(i + 1, 5).setValue(loc.lat); 
           basicSheet.getRange(i + 1, 6).setValue(loc.lng);
-          successCount++; Utilities.sleep(100);
+          
+          // 2. 【ここを修正！】長ったらしいURLを「🗺️」の絵文字リンクに変身させる
+          var mapUrl = "https://www.google.com/maps/search/?api=1&query=" + encodeURIComponent(address);
+          // スプレッドシートの「=HYPERLINK("URL", "表示文字")」という数式を組み立てる
+          var hyperlinkFormula = '=HYPERLINK("' + mapUrl + '", "🗺️")';
+          
+          // 7列目（＝G列）に数式として書き込みます
+          basicSheet.getRange(i + 1, 7).setFormula(hyperlinkFormula); 
+          
+          successCount++; 
+          Utilities.sleep(100);
         }
-      } catch (e) { console.error("エラー: " + e.message); }
+      } catch (e) { 
+        console.error("エラー: " + e.message); 
+      }
     }
   }
-  if (successCount > 0) Browser.msgBox("完了", successCount + " 名の緯度経度を自動取得しました！", Browser.Buttons.OK);
+  if (successCount > 0) Browser.msgBox("完了", successCount + " 名の緯度経度とマップリンク(🗺️)を自動取得しました！", Browser.Buttons.OK);
 }
 /**
  * 【実績自動蓄積システム】今日の運行表を t_past_records の一番下に自動でコピペ追記する
@@ -600,4 +690,145 @@ function saveToPastRecords() {
   pastSheet.getRange(startRow, 1, valuesToSave.length, 10).setValues(valuesToSave);
   
   Browser.msgBox("完了", "本日の配車結果（" + valuesToSave.length + "行）を、実績データ（t_past_records）の末尾に完全保存しました！", Browser.Buttons.OK);
+}
+/**
+ * LINEにそのまま貼り付けられる送迎運行表テキストを生成する関数（マスタ連動・マップリンク付き）
+ */
+function generateLineCopyText() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var attendanceSheet = ss.getSheetByName('t_daily_attendance'); // ボタンと出力先
+  var outputSheet = ss.getSheetByName('t_routing_outputs');     // 配車データ元
+  var userSheet = ss.getSheetByName('m_user_basics');           // 利用者マスタ
+  var vehicleSheet = ss.getSheetByName('m_vehicles');           // 車両マスタ
+  
+  if (!attendanceSheet || !outputSheet || !userSheet || !vehicleSheet) {
+    Browser.msgBox("エラー", "必要なシート（t_daily_attendance, t_routing_outputs, m_user_basics, m_vehicles）のいずれかが見つかりません。", Browser.Buttons.OK);
+    return;
+  }
+  
+  // ─── 1. 各種マスタデータを読み込んで「ID ➔ 日本語」の変換辞書を作る ───
+  
+  // ① 車両マスタの読み込み (A列: ID, B列: 車両名)
+  var vehicleMap = {};
+  var vehicleData = vehicleSheet.getDataRange().getValues();
+  for (var i = 1; i < vehicleData.length; i++) {
+    var vId = String(vehicleData[i][0]).trim();
+    var vName = String(vehicleData[i][1]).trim();
+    if (vId) vehicleMap[vId] = vName;
+  }
+  
+  // ② 利用者マスタの読み込み (A列: ID, B列: 名前, D列: 住所)
+  var userMap = {};
+  var userData = userSheet.getDataRange().getValues();
+  for (var i = 1; i < userData.length; i++) {
+    var uId = String(userData[i][0]).trim();
+    var uName = String(userData[i][1]).trim();
+    var uAddress = userData[i][3] ? String(userData[i][3]).trim() : ""; // D列(インデックス3)が住所
+    
+    if (uId) {
+      userMap[uId] = {
+        name: uName,
+        address: uAddress
+      };
+    }
+  }
+  
+  // ─── 2. 配車結果データの読み込みと、ズレない列特定 ───
+  var data = outputSheet.getDataRange().getValues();
+  if (data.length <= 1) {
+    Browser.msgBox("通知", "配車データがありません。先に配車計算を実行してください。", Browser.Buttons.OK);
+    return;
+  }
+  
+  var header = data[0];
+  var colVehicle = -1;
+  var colTime = -1;
+  var colUserId = -1;
+  var colDirection = -1;
+  
+  // ヘッダーの文字から列の位置を正確に自動スキャン
+  for (var c = 0; c < header.length; c++) {
+    var hName = String(header[c]).toLowerCase().trim();
+    if (hName.indexOf('vehicle_id') !== -1) colVehicle = c;
+    if (hName.indexOf('time') !== -1 || hName.indexOf('arrival') !== -1 || hName === '時間') colTime = c;
+    if (hName.indexOf('user_id') !== -1 || hName.indexOf('passenger_id') !== -1 || hName === '利用者id') colUserId = c;
+    if (hName.indexOf('direction') !== -1 || hName === '方向') colDirection = c;
+  }
+  
+  // 【重要】万が一自動検出に失敗した場合の、シート構造から逆算した手動フォールバック設定
+  if (colVehicle === -1) colVehicle = 1;   // B列 (vehicle_id)
+  if (colTime === -1) colTime = 4;          // E列（通常、ここに時間が入ります）
+  if (colUserId === -1) colUserId = 7;      // H列 (user_id) ※前回ここにM002が出ていたため確実
+  if (colDirection === -1) colDirection = 5; // F列 (direction) ※前回ここに「往路」が出ていたため確実
+  
+  // ─── 3. LINE用テキストの組み立て（IDを日本語に変換しながら結合） ───
+  var dateStr = Utilities.formatDate(new Date(), "JST", "yyyy/MM/dd");
+  var lineText = "🚐 【本日の送迎運行表】 " + dateStr + "\n";
+  lineText += "━━━━━━━━━━━━━━\n";
+  
+  var currentVehicleId = "";
+  var currentDirection = "";
+  
+  for (var i = 1; i < data.length; i++) {
+    var vId = data[i][colVehicle] ? String(data[i][colVehicle]).trim() : "";
+    var time = data[i][colTime];
+    var uId = data[i][colUserId] ? String(data[i][colUserId]).trim() : "";
+    var direction = data[i][colDirection] ? String(data[i][colDirection]).trim() : "";
+    
+    // ヘッダー行や空行、おかしなシステム文字の行はスキップ
+    if (vId === "vehicle_id" || !uId || uId === "user_id" || uId === "direction") continue;
+    
+    // ① 車両IDから「本物の車両名」をマスタ引き
+    var vehicleName = vehicleMap[vId] || vId;
+    
+    // ② 利用者IDから「本物の名前」と「住所」をマスタ引き
+    var userName = uId;
+    var mapUrl = "";
+    if (userMap[uId]) {
+      userName = userMap[uId].name;
+      if (userMap[uId].address) {
+        // LINEでタップして直接一発起動できるGoogleマップのURLを生成
+        mapUrl = "https://www.google.com/maps/search/?api=1&query=" + encodeURIComponent(userMap[uId].address);
+      }
+    }
+    
+    // 時間の表示形式を「HH:mm」に整える
+    var timeStr = "--:--";
+    if (time instanceof Date) {
+      timeStr = Utilities.formatDate(time, "JST", "HH:mm");
+    } else if (time && String(time).trim() !== "") {
+      timeStr = String(time).trim();
+      // 万が一、列のズレで「往路」などの文字を時間を拾ってしまっていた場合のセーフティ
+      if (timeStr === "往路" || timeStr === "復路") timeStr = "時間指定なし";
+    }
+    
+    // 車両が切り替わったら、新しい車両名で見出しを入れる
+    if (vId !== currentVehicleId) {
+      currentVehicleId = vId;
+      lineText += "\n🚗 【" + vehicleName + "】\n";
+      currentDirection = ""; // 便をリセット
+    }
+    
+    // 往路/復路（便）が切り替わったら見出しを入れる
+    if (direction !== currentDirection) {
+      currentDirection = direction;
+      lineText += "  ── " + currentDirection + " ──\n";
+    }
+    
+    // 利用者の送迎予定を1行ずつ追加
+    lineText += "  🟢 " + timeStr + "  " + userName + " 様\n";
+    // Googleマップのリンクがあれば、次の行にインデント付きで差し込む
+    if (mapUrl) {
+      lineText += "     🗺️ マップ: " + mapUrl + "\n";
+    }
+  }
+  
+  lineText += "\n━━━━━━━━━━━━━━\n🏁 今日も安全運転でお願いします！";
+  
+  // 4. 【出力】t_daily_attendance シートの「J1セル」にドカンと書き込み
+  attendanceSheet.getRange("J1").setValue(lineText);
+  
+  // 5. 画面中央に完了ポップアップを表示
+  var ui = SpreadsheetApp.getUi();
+  ui.alert("生成完了", "t_daily_attendanceのJ1セルに、マスタ連動＆マップリンク付きのテキストを保存しました！", ui.ButtonSet.OK);
 }
